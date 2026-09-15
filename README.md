@@ -39,7 +39,7 @@ python train.py --epochs 10 --batch-size 32
 
 CIFAR-10 downloads automatically into `data/` on first run. The best
 checkpoint (by test accuracy) is saved to `checkpoints/best_model.pth`
-(not tracked in git — re-run `train.py` to reproduce it).
+(not tracked in git - re-run `train.py` to reproduce it).
 
 Useful flags:
 
