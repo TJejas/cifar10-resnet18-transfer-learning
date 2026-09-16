@@ -39,9 +39,9 @@ def build_dataloaders(data_dir: str, img_size: int, batch_size: int, subset: int
         test_set = Subset(test_set, list(range(min(subset // 5 or 1, len(test_set)))))
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                               num_workers=workers, pin_memory=True)
+                               num_workers=workers, pin_memory=False)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False,
-                              num_workers=workers, pin_memory=True)
+                              num_workers=workers, pin_memory=False)
     return train_loader, test_loader, train_set.dataset.classes if subset else train_set.classes
 
 
@@ -87,83 +87,25 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
     return total_loss / total, correct / total
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--output-dir", default="outputs")
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--img-size", type=int, default=224)
-    parser.add_argument("--lr-head", type=float, default=1e-3)
-    parser.add_argument("--lr-backbone", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--subset", type=int, default=0, help="limit train set size for smoke tests")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
-
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    train_loader, test_loader, classes = build_dataloaders(
-        args.data_dir, args.img_size, args.batch_size, args.subset, args.workers
-    )
-    print(f"Train batches: {len(train_loader)}, Test batches: {len(test_loader)}, classes: {classes}")
-
-    model = build_model(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam([
-        {"params": model.layer4.parameters(), "lr": args.lr_backbone},
-        {"params": model.fc.parameters(), "lr": args.lr_head},
-    ])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-
-    history = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
-    best_acc = 0.0
-    start = time.time()
-
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
-        train_loss, train_acc = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
-        test_loss, test_acc = run_epoch(model, test_loader, criterion, device)
-        scheduler.step()
-
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["test_loss"].append(test_loss)
-        history["test_acc"].append(test_acc)
-
-        print(f"Epoch {epoch}/{args.epochs} "
-              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-              f"test_loss={test_loss:.4f} test_acc={test_acc:.4f} "
-              f"({time.time() - epoch_start:.1f}s)")
-
-        if test_acc > best_acc:
-            best_acc = test_acc
-            torch.save(model.state_dict(), Path(args.checkpoint_dir) / "best_model.pth")
-
-    total_time = time.time() - start
-    print(f"Training complete in {total_time / 60:.1f} min. Best test accuracy: {best_acc:.4f}")
-
+def save_results(output_dir: Path, history: dict, best_acc: float, args, device, total_time_minutes: float):
+    completed_epochs = len(history["test_acc"])
     results = {
         "best_test_accuracy": best_acc,
-        "final_test_accuracy": history["test_acc"][-1],
-        "epochs": args.epochs,
+        "final_test_accuracy": history["test_acc"][-1] if history["test_acc"] else None,
+        "epochs_completed": completed_epochs,
+        "epochs_target": args.epochs,
         "batch_size": args.batch_size,
         "img_size": args.img_size,
         "device": str(device),
-        "total_time_minutes": round(total_time / 60, 2),
+        "total_time_minutes": round(total_time_minutes, 2),
         "history": history,
     }
-    with open(Path(args.output_dir) / "results.json", "w") as f:
+    with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    epochs_range = range(1, args.epochs + 1)
+    if completed_epochs == 0:
+        return
+    epochs_range = range(1, completed_epochs + 1)
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     axes[0].plot(epochs_range, history["train_loss"], label="train")
     axes[0].plot(epochs_range, history["test_loss"], label="test")
@@ -178,8 +120,108 @@ def main():
     axes[1].legend()
 
     fig.tight_layout()
-    fig.savefig(Path(args.output_dir) / "training_curves.png", dpi=150)
-    print(f"Saved results to {args.output_dir}/")
+    fig.savefig(output_dir / "training_curves.png", dpi=150)
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--epochs", type=int, default=10, help="total target epoch count")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--lr-head", type=float, default=1e-3)
+    parser.add_argument("--lr-backbone", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--subset", type=int, default=0, help="limit train set size for smoke tests")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true",
+                         help="resume from checkpoints/last.pth if it exists")
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""), flush=True)
+
+    output_dir = Path(args.output_dir)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_ckpt_path = checkpoint_dir / "last.pth"
+
+    train_loader, test_loader, classes = build_dataloaders(
+        args.data_dir, args.img_size, args.batch_size, args.subset, args.workers
+    )
+    print(f"Train batches: {len(train_loader)}, Test batches: {len(test_loader)}, classes: {classes}", flush=True)
+
+    model = build_model(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam([
+        {"params": model.layer4.parameters(), "lr": args.lr_backbone},
+        {"params": model.fc.parameters(), "lr": args.lr_head},
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+
+    history = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
+    best_acc = 0.0
+    start_epoch = 1
+    prior_elapsed_minutes = 0.0
+
+    if args.resume and last_ckpt_path.exists():
+        ckpt = torch.load(last_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        scaler.load_state_dict(ckpt["scaler_state"])
+        history = ckpt["history"]
+        best_acc = ckpt["best_acc"]
+        start_epoch = ckpt["epoch"] + 1
+        prior_elapsed_minutes = ckpt.get("elapsed_minutes", 0.0)
+        print(f"Resumed from epoch {ckpt['epoch']} (best_acc={best_acc:.4f})", flush=True)
+
+    start = time.time()
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start = time.time()
+        train_loss, train_acc = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
+        test_loss, test_acc = run_epoch(model, test_loader, criterion, device)
+        scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["test_loss"].append(test_loss)
+        history["test_acc"].append(test_acc)
+
+        print(f"Epoch {epoch}/{args.epochs} "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+              f"test_loss={test_loss:.4f} test_acc={test_acc:.4f} "
+              f"({time.time() - epoch_start:.1f}s)", flush=True)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), checkpoint_dir / "best_model.pth")
+
+        total_time_minutes = prior_elapsed_minutes + (time.time() - start) / 60
+
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "history": history,
+            "best_acc": best_acc,
+            "elapsed_minutes": total_time_minutes,
+        }, last_ckpt_path)
+
+        save_results(output_dir, history, best_acc, args, device, total_time_minutes=total_time_minutes)
+
+    total_time_minutes = prior_elapsed_minutes + (time.time() - start) / 60
+    print(f"Training complete in {total_time_minutes:.1f} min. Best test accuracy: {best_acc:.4f}", flush=True)
+    print(f"Saved results to {output_dir}/", flush=True)
 
 
 if __name__ == "__main__":
